@@ -35,7 +35,6 @@ export interface SourcingState {
   messages: BaseMessage[];
   candidates: SupplierCandidate[];
   finalSuppliers: SupplierCandidate[];
-  qualificationLevel: "identified" | "qualified" | "exploitable" | "rejected";
   currentAgent: string; // Pour les logs de progression
 }
 
@@ -89,10 +88,6 @@ export const sourcingAgentState: StateGraphArgs<SourcingState>["channels"] = {
   finalSuppliers: {
     value: (x: SupplierCandidate[], y: SupplierCandidate[]) => y ?? x,
     default: () => [],
-  },
-  qualificationLevel: {
-    value: (x: "identified" | "qualified" | "exploitable" | "rejected", y: "identified" | "qualified" | "exploitable" | "rejected") => y ?? x,
-    default: () => "identified",
   },
   currentAgent: {
     value: (x: string, y: string) => y ?? x,
