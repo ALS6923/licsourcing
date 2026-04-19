@@ -180,37 +180,39 @@ export const scoringConsolidationNode = async (state: SourcingState): Promise<Pa
 
   const qualifiedSuppliers = [];
   for (const s of finalSuppliers) {
-    const hasWebsite = s.website && s.website !== "Non Vérifié" && s.website.includes('.');
-    const hasContact = (s.email && s.email !== "Non Vérifié") || (s.phone && s.phone !== "Non Vérifié");
+    const hasWebsite = s.website && s.website !== "Non Vérifié" && s.website !== "N/A" && s.website.includes('.');
+    const hasContact = (s.email && s.email !== "Non Vérifié" && s.email !== "Non identifié") || 
+                       (s.phone && s.phone !== "Non Vérifié" && s.phone !== "Non identifié");
     const baseScore = s.relevanceScore || 0;
     
-    let status: "Exploitable" | "À vérifier manuellement" | "Rejeté" = "Rejeté";
-    let finalScore = baseScore;
+    let qualificationLevel: "identified" | "qualified" | "exploitable" | "rejected" = "identified";
+    let status = "Identifié";
     let reason = "";
 
-    // SEUILS DE DÉCISION AETHER V2
-    if (!hasWebsite || baseScore < 40) {
+    // LOGIQUE DE QUALIFICATION AETHER V3
+    if (baseScore < 30) {
+      // Rejet uniquement si vraiment hors sujet
+      qualificationLevel = "rejected";
       status = "Rejeté";
-      reason = !hasWebsite ? "Aucun site web officiel détecté." : "Score de pertinence trop faible.";
-      finalScore = Math.min(baseScore, 30);
-    } else if (hasWebsite && !hasContact) {
-      status = "À vérifier manuellement";
-      // Sanction légère pour absence de contact automatisé mais site OK
-      finalScore = baseScore >= 80 ? 75 : 60;
-      reason = "Profil industriel valide mais nécessite une recherche de contact manuelle.";
-    } else if (hasWebsite && hasContact) {
-      if (baseScore >= 70) {
-        status = "Exploitable";
-        reason = "Identité et contact confirmés. Haute pertinence.";
-        finalScore = baseScore;
-      } else {
-        status = "À vérifier manuellement";
-        reason = "Identité confirmée mais adéquation produit à vérifier.";
-        finalScore = baseScore;
-      }
+      reason = "Faible pertinence par rapport au besoin métier.";
+    } else if (hasWebsite && hasContact && baseScore >= 70) {
+      // Le top : site + contact + bon score
+      qualificationLevel = "exploitable";
+      status = "Exploitable";
+      reason = "Coordonnées complètes et haute pertinence.";
+    } else if (hasWebsite && (s.activityStatus?.toLowerCase().includes("actif") || baseScore >= 50)) {
+      // Qualifié : On a un site et des signes de vie, même sans contact direct
+      qualificationLevel = "qualified";
+      status = "Qualifié";
+      reason = hasContact ? "Profil cohérent avec contact." : "Activité confirmée, contact à enrichir.";
+    } else {
+      // Identifié : Par défaut si pertinent mais incomplet
+      qualificationLevel = "identified";
+      status = "Identifié";
+      reason = !hasWebsite ? "Site web manquant" : "Preuves d'activité incomplètes";
     }
 
-    if (status !== "Rejeté") {
+    if (qualificationLevel !== "rejected") {
       const fullComment = `${status} : ${reason} | ${s.businessComment || ""}`.substring(0, 500);
       
       // PERSISTANCE DANS SUPABASE
@@ -223,11 +225,12 @@ export const scoringConsolidationNode = async (state: SourcingState): Promise<Pa
         website: s.website,
         contact_phone: s.phone,
         contact_email: s.email,
-        relevance_score: finalScore,
+        relevance_score: baseScore,
         confidence_score: s.confidenceScore || 70,
         legal_status: s.legalStatus || "Non vérifié",
         activity_status: s.activityStatus || "Inconnu",
-        ai_comment: fullComment
+        ai_comment: fullComment,
+        qualification_level: qualificationLevel // Nouveauté V3
       }]).select().single();
 
       if (!supplierError && supplierData) {
@@ -250,9 +253,10 @@ export const scoringConsolidationNode = async (state: SourcingState): Promise<Pa
 
         qualifiedSuppliers.push({
           ...s,
-          id: supplierData.id, // On récupère le vrai UUID
+          id: supplierData.id, 
           status,
-          relevanceScore: finalScore,
+          relevanceScore: baseScore,
+          qualificationLevel: qualificationLevel,
           aiComment: fullComment
         });
       } else if (supplierError) {

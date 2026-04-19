@@ -4,13 +4,13 @@ import path from 'path';
 // Charger les variables d'environnement (DÈS LE DÉBUT)
 const envResult = dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 
-import type { SourcingState, SupplierCandidate } from '../lib/agents/state';
+import type { SourcingState, SupplierCandidate } from '../src/lib/agents/state';
 
 async function runTest() {
   // Import dynamique obligatoire pour s'assurer que dotenv a chargé les variables 
   // avant que les clients (supabase, openai) ne s'initialisent
-  const { sourcingAgentGraph } = await import('../lib/agents/graph');
-  const { supabase } = await import('../lib/supabase');
+  const { sourcingAgentGraph } = await import('../src/lib/agents/graph');
+  const { supabase } = await import('../src/lib/supabase');
 
   const startTime = Date.now();
   console.log("--- DÉMARRAGE DU TEST TECHNIQUE AETHER ---");
@@ -87,11 +87,13 @@ async function runTest() {
     console.log(`Temps total : ${duration} secondes`);
     console.log(`Candidats identifiés (Search) : ${finalState.candidates.length}`);
     
-    const exploitable = finalState.finalSuppliers.filter((s: SupplierCandidate) => s.status === "Exploitable");
-    const toVerify = finalState.finalSuppliers.filter((s: SupplierCandidate) => s.status === "À vérifier manuellement");
+    const exploitable = finalState.finalSuppliers.filter((s: SupplierCandidate) => s.qualificationLevel === "exploitable");
+    const qualified = finalState.finalSuppliers.filter((s: SupplierCandidate) => s.qualificationLevel === "qualified");
+    const identified = finalState.finalSuppliers.filter((s: SupplierCandidate) => s.qualificationLevel === "identified");
     
     console.log(`Fournisseurs EXPLOITABLES : ${exploitable.length}`);
-    console.log(`Fournisseurs À VÉRIFIER : ${toVerify.length}`);
+    console.log(`Fournisseurs QUALIFIÉS : ${qualified.length}`);
+    console.log(`Fournisseurs IDENTIFIÉS : ${identified.length}`);
     
     // Taux
     const totalFound = finalState.candidates.length || 1;
@@ -103,7 +105,7 @@ async function runTest() {
     // Détails par fournisseur
     console.log("\nÉCHANTILLON DES RÉSULTATS (DÉTAILLÉS) :");
     finalState.finalSuppliers.slice(0, 5).forEach((s: SupplierCandidate, idx: number) => {
-      console.log(`${idx + 1}. [${s.status}] ${s.name} (${s.country}) - Relevance: ${s.relevanceScore}/100`);
+      console.log(`${idx + 1}. [${s.qualificationLevel?.toUpperCase()}] ${s.name} (${s.country}) - Relevance: ${s.relevanceScore}/100`);
       console.log(`   - Site : ${s.website || "N/A"}`);
       console.log(`   - Contact : ${s.email || "N/A"} / ${s.phone || "N/A"}`);
       console.log(`   - Commentaire Métier : ${s.aiComment?.split('|')[1]?.trim().substring(0, 200)}...`);

@@ -22,6 +22,7 @@ interface Supplier {
   legal_status: string;
   activity_status: string;
   ai_comment: string;
+  qualification_level?: "identified" | "qualified" | "exploitable" | "rejected";
 }
 
 interface AgentLog {
@@ -311,6 +312,16 @@ function DashboardContent() {
                           <span className="px-2.5 py-1 bg-gray-100 dark:bg-gray-800 rounded-md text-xs font-semibold">
                             {sup.country}
                           </span>
+                          {sup.qualification_level && (
+                            <span className={`px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider ${
+                              sup.qualification_level === 'exploitable' ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' :
+                              sup.qualification_level === 'qualified' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400' :
+                              'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'
+                            }`}>
+                              {sup.qualification_level === 'exploitable' ? 'Exploitable' : 
+                               sup.qualification_level === 'qualified' ? 'Qualifié' : 'Identifié'}
+                            </span>
+                          )}
                         </div>
                         <p className="text-brand-600 dark:text-brand-400 font-medium mb-6 flex items-center gap-2">
                           <Factory className="w-4 h-4" /> {sup.specialty}

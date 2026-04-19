@@ -17,7 +17,8 @@ export interface SupplierCandidate {
   activityStatus?: string;
   urlChecked?: boolean;
   detectedType?: string; // Fabricant, Distributeur
-  status?: "Exploitable" | "À vérifier manuellement" | "Rejeté";
+  status?: string; // Label descriptif (ex: "Site manquant", "Exploitable")
+  qualificationLevel?: "identified" | "qualified" | "exploitable" | "rejected";
 }
 
 export interface SourcingState {
@@ -87,6 +88,10 @@ export const sourcingAgentState: StateGraphArgs<SourcingState>["channels"] = {
   finalSuppliers: {
     value: (x: SupplierCandidate[], y: SupplierCandidate[]) => y ?? x,
     default: () => [],
+  },
+  qualificationLevel: {
+    value: (x: string, y: string) => y ?? x,
+    default: () => "identified",
   },
   currentAgent: {
     value: (x: string, y: string) => y ?? x,
