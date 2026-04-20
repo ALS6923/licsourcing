@@ -18,7 +18,7 @@ export const llm = new ChatOpenAI({
   },
 });
 
-// Outil de recherche Tavily (Implémentation directe pour éviter les conflits de version)
+// Outil de recherche Tavily
 export const tavily = {
   invoke: async (query: string) => {
     const response = await fetch("https://api.tavily.com/search", {
@@ -33,6 +33,55 @@ export const tavily = {
     });
     const data = await response.json();
     return JSON.stringify(data.results);
+  }
+};
+
+// Outil de recherche Perplexity via OpenRouter
+export const perplexity = {
+  invoke: async (query: string) => {
+    if (!process.env.OPENROUTER_API_KEY) {
+      throw new Error("Clé API OpenRouter manquante.");
+    }
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        "HTTP-Referer": "https://aether-sourcing.io",
+        "X-Title": "Aether Sourcing SaaS",
+      },
+      body: JSON.stringify({
+        model: "perplexity/sonar", // Utilise Sonar via OpenRouter
+        messages: [
+          { role: "system", content: "Tu es un expert en sourcing industriel. Ta mission est d'identifier des fournisseurs réels et actifs. Pour chaque fournisseur, fournis : Nom, Site Web (essentiel), Pays, et une brève description de leur activité. Cite tes sources." },
+          { role: "user", content: query }
+        ],
+        temperature: 0.1,
+      }),
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`Erreur OpenRouter/Perplexity: ${err}`);
+    }
+
+    const data = await response.json();
+    return data.choices[0].message.content;
+  }
+};
+
+/**
+ * Wrapper unifié pour le moteur de recherche
+ * Permet un basculement simple via variable d'environnement
+ */
+export const searchEngine = {
+  invoke: async (query: string) => {
+    const provider = process.env.SEARCH_PROVIDER || "tavily";
+    console.log(`[SearchEngine] Utilisation du moteur: ${provider}`);
+    if (provider === "perplexity") {
+      return await perplexity.invoke(query);
+    }
+    return await tavily.invoke(query);
   }
 };
 

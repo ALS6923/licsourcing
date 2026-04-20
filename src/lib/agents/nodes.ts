@@ -1,6 +1,6 @@
 import { AIMessage } from "@langchain/core/messages";
 import { SourcingState, SupplierCandidate } from "./state";
-import { llm, tavily, apify, logAgentAction } from "./tools";
+import { llm, searchEngine, apify, logAgentAction } from "./tools";
 import { supabase } from "@/lib/supabase";
 import { z } from "zod";
 
@@ -27,47 +27,91 @@ const VerificationSchema = z.object({
 // 1. Agent Explorateur Régional
 export const regionalSearchNode = async (state: SourcingState): Promise<Partial<SourcingState>> => {
   const geodataRaw = state.isAllCountries ? "Monde Entier" : [...state.geoRegions, ...state.geoCountries].join(", ");
-  await logAgentAction(supabase, state.requestId, "RegionalSearch", `Démarrage de la recherche pour ${state.product} sur les zones : ${geodataRaw}`);
+  await logAgentAction(supabase, state.requestId, "RegionalSearch", `Démarrage de la recherche massive pour ${state.product} sur les zones : ${geodataRaw}`);
 
-  // 1. Construction de la requête de recherche
-  const query = `${state.product} manufacturer supplier factory ${state.geoCountries.join(" ")} ${state.geoRegions.join(" ")}`;
+  // 1. Génération de requêtes variées (FR/EN) via LLM
+  const queryGenResponse = await llm.invoke([
+    ["system", "Tu es un expert en sourcing industriel B2B. Génère 10 requêtes de recherche Google/Tavily variées pour trouver un maximum de fournisseurs. Utilise un mélange de Français et d'Anglais. Varie les types d'acteurs (fabricant, usine, grossiste, distributeur, wholesale, manufacturer, factory). Réponds UNIQUEMENT par la liste des requêtes séparées par des points-virgules."],
+    ["user", `Besoin : ${state.product} (${state.description})\nZones : ${geodataRaw}`]
+  ]);
   
-  // 2. Recherche via Tavily
-  const searchResults = await tavily.invoke(query);
+  const queries = queryGenResponse.content.toString().split(';').map(q => q.trim()).filter(q => q.length > 3);
+  const finalQueries = queries.length > 0 ? queries : [`${state.product} manufacturer supplier factory ${geodataRaw}`];
+
+  await logAgentAction(supabase, state.requestId, "RegionalSearch", `Génération de ${finalQueries.length} requêtes de recherche (FR/EN).`);
+
+  // 2. Recherche en Parallèle
+  const searchResultsPromises = finalQueries.map(q => searchEngine.invoke(q));
+  const allRawResults = await Promise.all(searchResultsPromises);
   
-  // 3. Extraction via LLM (OpenRouter) - On utilise un prompt JSON strict pour éviter les erreurs de format OpenRouter
+  // 3. Fusion et Déduplication (URL)
+  const mergedResults: any[] = [];
+  const seenUrls = new Set();
+  let totalRawCount = 0;
+
+  for (const resStr of allRawResults) {
+    try {
+      // Cas Tavily (JSON)
+      const parsed = JSON.parse(resStr);
+      if (Array.isArray(parsed)) {
+        totalRawCount += parsed.length;
+        for (const item of parsed) {
+          if (item.url && !seenUrls.has(item.url)) {
+            seenUrls.add(item.url);
+            mergedResults.push(item);
+          }
+        }
+      }
+    } catch (e) {
+      // Cas Perplexity ou format textuel
+      mergedResults.push({ content: resStr, url: `text-source-${Date.now()}` });
+    }
+  }
+
+  await logAgentAction(supabase, state.requestId, "RegionalSearch", `Nettoyage terminé. ${totalRawCount} résultats bruts -> ${mergedResults.length} sources uniques.`);
+  
+  // 4. Extraction via LLM (OpenRouter) - On utilise un prompt permissif
   const response = await llm.invoke([
-    ["system", "Tu es un expert en sourcing industriel. Analyse les résultats de recherche fournis et extrait une liste de fournisseurs potentiels correspondants exactement au besoin. Réponds UNIQUEMENT au format JSON suivant : { \"candidates\": [ { \"name\": \"...\", \"country\": \"...\", \"website\": \"...\", \"description\": \"...\" } ] }"],
-    ["user", `Besoin : ${state.product} (${state.description})\n\nRésultats Tavily :\n${searchResults}`]
+    ["system", "Tu es un extracteur de données industriel. Analyse les résultats fournis et liste TOUS les fournisseurs potentiels (entreprises) trouvés. Sois exhaustif, ne filtre pas la qualité à cette étape. Limite-toi aux entreprises pertinentes pour le produit demandé. Réponds UNIQUEMENT au format JSON : { \"candidates\": [ { \"name\": \"...\", \"country\": \"...\", \"website\": \"...\", \"description\": \"...\" } ] }"],
+    ["user", `Besoin : ${state.product}\n\nSources :\n${JSON.stringify(mergedResults).substring(0, 50000)}`] // Capacité max gpt-4o-mini
   ]);
 
   let extraction;
   try {
-    // Nettoyage du markdown si le LLM en a mis
     const content = response.content.toString().replace(/```json|```/g, "").trim();
     extraction = JSON.parse(content);
   } catch (e) {
-    console.error("[Parse Error] Échec de l'extraction JSON, tentative de repli...", response.content);
+    console.error("[Parse Error] Extraction", response.content);
     extraction = { candidates: [] };
   }
 
-  // On limite strictement à 10 candidats pour ce run (ou selon budget)
-  const candidates: SupplierCandidate[] = extraction.candidates.slice(0, 10).map((c: any, i: number) => ({
-    id: `c-${Date.now()}-${i}`,
-    name: c.name,
-    country: c.country,
-    website: c.website,
-    aiComment: c.description,
-    technicalAudit: { initialExtraction: c }
-  }));
+  // 5. Déduplication des Candidats (Website / Nom)
+  const uniqueCandidates = new Map();
+  extraction.candidates.forEach((c: any) => {
+    const key = c.website ? c.website.toLowerCase().replace(/^(https?:\/\/)?(www\.)?/, '').split('/')[0] : c.name.toLowerCase().trim();
+    if (!uniqueCandidates.has(key)) {
+      uniqueCandidates.set(key, c);
+    }
+  });
 
-  console.log(`[RegionalSearch] ${candidates.length} candidats retenus sur ${extraction.candidates.length} identifiés.`);
-  await logAgentAction(supabase, state.requestId, "RegionalSearch", `${candidates.length} candidats identifiés (Limit: 10).`);
+  // 6. Limite de sécurité (100)
+  const candidates: SupplierCandidate[] = Array.from(uniqueCandidates.values())
+    .slice(0, 100)
+    .map((c: any, i: number) => ({
+      id: `c-${Date.now()}-${i}`,
+      name: c.name,
+      country: c.country,
+      website: c.website,
+      aiComment: c.description,
+      technicalAudit: { initialExtraction: c }
+    }));
+
+  await logAgentAction(supabase, state.requestId, "RegionalSearch", `${candidates.length} candidats uniques retenus pour qualification (Limite: 100).`);
 
   return {
     candidates,
     currentAgent: "RegionalSearch",
-    messages: [new AIMessage(`Exploration terminée. ${candidates.length} entreprises retenues.`)]
+    messages: [new AIMessage(`${candidates.length} entreprises identifiées par multi-requêtes.`)]
   };
 };
 
@@ -75,23 +119,28 @@ export const regionalSearchNode = async (state: SourcingState): Promise<Partial<
 export const legalVerificationNode = async (state: SourcingState): Promise<Partial<SourcingState>> => {
   await logAgentAction(supabase, state.requestId, "LegalVerification", `Analyse de la légitimité pour ${state.candidates.length} entreprises.`);
 
-  const verifiedCandidates = await Promise.all(state.candidates.map(async (c) => {
-    // Dans un run réel, on ferait une recherche spécifique par entreprise
-    const query = `official registry ${c.name} ${c.country} legal status active`;
-    const check = await tavily.invoke(query);
-    
-    // Le LLM juge sur les snippets
-    const judge = await llm.invoke([
-      ["system", "Vérifie si cette entreprise semble officiellement enregistrée et active. Réponds par un statut court (ex: 'Actif (Registre)', 'Non trouvé')."],
-      ["user", `Entreprise : ${c.name}\nContexte de recherche :\n${check}`]
-    ]);
+  const verifiedCandidates = [];
+  const concurrencyLimit = 5;
+  
+  for (let i = 0; i < state.candidates.length; i += concurrencyLimit) {
+    const batch = state.candidates.slice(i, i + concurrencyLimit);
+    const batchResults = await Promise.all(batch.map(async (c) => {
+      const query = `official registry ${c.name} ${c.country} legal status active`;
+      const check = await searchEngine.invoke(query);
+      
+      const judge = await llm.invoke([
+        ["system", "Vérifie si cette entreprise semble officiellement enregistrée et active. Réponds par un statut court (ex: 'Actif (Registre)', 'Non trouvé')."],
+        ["user", `Entreprise : ${c.name}\nContexte de recherche :\n${check}`]
+      ]);
 
-    return {
-      ...c,
-      legalStatus: judge.content.toString(),
-      technicalAudit: { ...c.technicalAudit, legalCheck: judge.content.toString(), rawLegalContext: check.substring(0, 500) }
-    };
-  }));
+      return {
+        ...c,
+        legalStatus: judge.content.toString(),
+        technicalAudit: { ...c.technicalAudit, legalCheck: judge.content.toString(), rawLegalContext: check.substring(0, 500) }
+      };
+    }));
+    verifiedCandidates.push(...batchResults);
+  }
 
   return {
     candidates: verifiedCandidates,
@@ -103,37 +152,41 @@ export const legalVerificationNode = async (state: SourcingState): Promise<Parti
 export const activityAndContactNode = async (state: SourcingState): Promise<Partial<SourcingState>> => {
   await logAgentAction(supabase, state.requestId, "ActivityContact", `Vérification de l'activité web et extraction des contacts.`);
 
-  const enriched = await Promise.all(state.candidates.map(async (c) => {
-    if (!c.website) return c;
+  const enriched = [];
+  const concurrencyLimit = 5;
 
-    // TODO: Utiliser Apify ici pour un scraping profond. 
-    // Pour ce premier test 'maîtrisé', on utilise Tavily pour trouver les pages de contact/about
-    const contactQuery = `site:${c.website} contact email phone about production factory`;
-    const contactData = await tavily.invoke(contactQuery);
+  for (let i = 0; i < state.candidates.length; i += concurrencyLimit) {
+    const batch = state.candidates.slice(i, i + concurrencyLimit);
+    const batchResults = await Promise.all(batch.map(async (c) => {
+      if (!c.website) return c;
 
-    const response = await llm.invoke([
-      ["system", "Analyse les données pour extraire les contacts officiels et déterminer si l'entreprise possède ses propres usines (Fabricant) ou si elle revend (Distributeur). Réponds UNIQUEMENT au format JSON suivant : { \"legalStatus\": \"...\", \"activityStatus\": \"...\", \"detectedType\": \"Fabricant|Distributeur|Non Identifié\", \"phone\": \"...\", \"email\": \"...\" }"],
-      ["user", `Société : ${c.name}\nSource Web :\n${contactData}`]
-    ]);
+      const contactQuery = `site:${c.website} contact email phone about production factory`;
+      const contactData = await searchEngine.invoke(contactQuery);
 
-    let info;
-    try {
-      const content = response.content.toString().replace(/```json|```/g, "").trim();
-      info = JSON.parse(content);
-    } catch (e) {
-      console.error("[Parse Error Contact]", response.content);
-      info = { phone: "Non trouvé", email: "Non trouvé", activityStatus: "Inconnu", detectedType: "Non Identifié" };
-    }
+      const response = await llm.invoke([
+        ["system", "Analyse les données pour extraire les contacts officiels et déterminer si l'entreprise possède ses propres usines (Fabricant) ou si elle revend (Distributeur). Réponds UNIQUEMENT au format JSON suivant : { \"legalStatus\": \"...\", \"activityStatus\": \"...\", \"detectedType\": \"Fabricant|Distributeur|Non Identifié\", \"phone\": \"...\", \"email\": \"...\" }"],
+        ["user", `Société : ${c.name}\nSource Web :\n${contactData}`]
+      ]);
 
-    return {
-      ...c,
-      phone: info.phone || "Non Vérifié",
-      email: info.email || "Non Vérifié",
-      activityStatus: info.activityStatus,
-      detectedType: info.detectedType,
-      technicalAudit: { ...c.technicalAudit, activityAndContact: info }
-    };
-  }));
+      let info;
+      try {
+        const content = response.content.toString().replace(/```json|```/g, "").trim();
+        info = JSON.parse(content);
+      } catch (e) {
+        info = { phone: "Non trouvé", email: "Non trouvé", activityStatus: "Inconnu", detectedType: "Non Identifié" };
+      }
+
+      return {
+        ...c,
+        phone: info.phone || "Non Vérifié",
+        email: info.email || "Non Vérifié",
+        activityStatus: info.activityStatus,
+        detectedType: info.detectedType,
+        technicalAudit: { ...c.technicalAudit, activityAndContact: info }
+      };
+    }));
+    enriched.push(...batchResults);
+  }
 
   return {
     candidates: enriched,
@@ -267,7 +320,14 @@ export const scoringConsolidationNode = async (state: SourcingState): Promise<Pa
 
   const sorted = qualifiedSuppliers.sort((a,b) => (b.relevanceScore || 0) - (a.relevanceScore || 0));
 
-  await logAgentAction(supabase, state.requestId, "Consolidation", `Sourcing terminé. ${sorted.length} fournisseurs persistés en base.`);
+  const stats = {
+    total: sorted.length,
+    exploitable: sorted.filter(s => s.qualificationLevel === "exploitable").length,
+    qualified: sorted.filter(s => s.qualificationLevel === "qualified").length,
+    identified: sorted.filter(s => s.qualificationLevel === "identified").length
+  };
+
+  await logAgentAction(supabase, state.requestId, "Consolidation", `Sourcing terminé (${process.env.SEARCH_PROVIDER}). Total: ${stats.total} | Exploitables: ${stats.exploitable} | Qualifiés: ${stats.qualified} | Identifiés: ${stats.identified}`);
 
   return {
     finalSuppliers: sorted,
