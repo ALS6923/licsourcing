@@ -115,82 +115,69 @@ export const regionalSearchNode = async (state: SourcingState): Promise<Partial<
   };
 };
 
-// 2. Agent de Vérification d'Existence Légale
-export const legalVerificationNode = async (state: SourcingState): Promise<Partial<SourcingState>> => {
-  await logAgentAction(supabase, state.requestId, "LegalVerification", `Analyse de la légitimité pour ${state.candidates.length} entreprises.`);
+// 2. Nœud d'Enrichissement Unifié (Légal + Contacts)
+export const unifiedEnrichmentNode = async (state: SourcingState): Promise<Partial<SourcingState>> => {
+  await logAgentAction(supabase, state.requestId, "Enrichment", `Enrichissement turbo pour ${state.candidates.length} entreprises (Batch: 15).`);
 
-  const verifiedCandidates = [];
-  const concurrencyLimit = 5;
+  const enrichedCandidates = [];
+  const concurrencyLimit = 15;
   
   for (let i = 0; i < state.candidates.length; i += concurrencyLimit) {
     const batch = state.candidates.slice(i, i + concurrencyLimit);
     const batchResults = await Promise.all(batch.map(async (c) => {
-      const query = `official registry ${c.name} ${c.country} legal status active`;
-      const check = await searchEngine.invoke(query);
-      
-      const judge = await llm.invoke([
-        ["system", "Vérifie si cette entreprise semble officiellement enregistrée et active. Réponds par un statut court (ex: 'Actif (Registre)', 'Non trouvé')."],
-        ["user", `Entreprise : ${c.name}\nContexte de recherche :\n${check}`]
+      // Exécution parallèle des deux tâches pour chaque candidat pour gagner du temps
+      const [legalData, contactData] = await Promise.all([
+        (async () => {
+          const query = `official registry ${c.name} ${c.country} legal status active`;
+          const check = await searchEngine.invoke(query, { depth: "basic" });
+          const judge = await llm.invoke([
+            ["system", "Vérifie si cette entreprise semble officiellement enregistrée et active. Réponds par un statut court (ex: 'Actif (Registre)', 'Non trouvé')."],
+            ["user", `Entreprise : ${c.name}\nContexte de recherche :\n${check}`]
+          ]);
+          return { legalStatus: judge.content.toString(), check };
+        })(),
+        (async () => {
+          if (!c.website) return { info: { phone: "N/A", email: "N/A", activityStatus: "N/A", detectedType: "Non Identifié" }, contactData: "" };
+          
+          const contactQuery = `site:${c.website} contact email phone about production factory`;
+          const contactDataRaw = await searchEngine.invoke(contactQuery, { depth: "basic" });
+          const response = await llm.invoke([
+            ["system", "Analyse les données pour extraire les contacts officiels et déterminer si l'entreprise possède ses propres usines (Fabricant) ou si elle revend (Distributeur). Réponds UNIQUEMENT au format JSON suivant : { \"legalStatus\": \"...\", \"activityStatus\": \"...\", \"detectedType\": \"Fabricant|Distributeur|Non Identifié\", \"phone\": \"...\", \"email\": \"...\" }"],
+            ["user", `Société : ${c.name}\nSource Web :\n${contactDataRaw}`]
+          ]);
+          
+          let info;
+          try {
+            const content = response.content.toString().replace(/```json|```/g, "").trim();
+            info = JSON.parse(content);
+          } catch (e) {
+            info = { phone: "Non trouvé", email: "Non trouvé", activityStatus: "Inconnu", detectedType: "Non Identifié" };
+          }
+          return { info, contactData: contactDataRaw };
+        })()
       ]);
 
       return {
         ...c,
-        legalStatus: judge.content.toString(),
-        technicalAudit: { ...c.technicalAudit, legalCheck: judge.content.toString(), rawLegalContext: check.substring(0, 500) }
+        legalStatus: legalData.legalStatus,
+        phone: contactData.info.phone || "Non Vérifié",
+        email: contactData.info.email || "Non Vérifié",
+        activityStatus: contactData.info.activityStatus,
+        detectedType: contactData.info.detectedType,
+        technicalAudit: { 
+          ...c.technicalAudit, 
+          legalCheck: legalData.legalStatus, 
+          rawLegalContext: legalData.check.substring(0, 500),
+          activityAndContact: contactData.info
+        }
       };
     }));
-    verifiedCandidates.push(...batchResults);
+    enrichedCandidates.push(...batchResults);
   }
 
   return {
-    candidates: verifiedCandidates,
-    currentAgent: "LegalVerification"
-  };
-};
-
-// 3. Agent d'Activité et Contacts
-export const activityAndContactNode = async (state: SourcingState): Promise<Partial<SourcingState>> => {
-  await logAgentAction(supabase, state.requestId, "ActivityContact", `Vérification de l'activité web et extraction des contacts.`);
-
-  const enriched = [];
-  const concurrencyLimit = 5;
-
-  for (let i = 0; i < state.candidates.length; i += concurrencyLimit) {
-    const batch = state.candidates.slice(i, i + concurrencyLimit);
-    const batchResults = await Promise.all(batch.map(async (c) => {
-      if (!c.website) return c;
-
-      const contactQuery = `site:${c.website} contact email phone about production factory`;
-      const contactData = await searchEngine.invoke(contactQuery);
-
-      const response = await llm.invoke([
-        ["system", "Analyse les données pour extraire les contacts officiels et déterminer si l'entreprise possède ses propres usines (Fabricant) ou si elle revend (Distributeur). Réponds UNIQUEMENT au format JSON suivant : { \"legalStatus\": \"...\", \"activityStatus\": \"...\", \"detectedType\": \"Fabricant|Distributeur|Non Identifié\", \"phone\": \"...\", \"email\": \"...\" }"],
-        ["user", `Société : ${c.name}\nSource Web :\n${contactData}`]
-      ]);
-
-      let info;
-      try {
-        const content = response.content.toString().replace(/```json|```/g, "").trim();
-        info = JSON.parse(content);
-      } catch (e) {
-        info = { phone: "Non trouvé", email: "Non trouvé", activityStatus: "Inconnu", detectedType: "Non Identifié" };
-      }
-
-      return {
-        ...c,
-        phone: info.phone || "Non Vérifié",
-        email: info.email || "Non Vérifié",
-        activityStatus: info.activityStatus,
-        detectedType: info.detectedType,
-        technicalAudit: { ...c.technicalAudit, activityAndContact: info }
-      };
-    }));
-    enriched.push(...batchResults);
-  }
-
-  return {
-    candidates: enriched,
-    currentAgent: "ActivityContact"
+    candidates: enrichedCandidates,
+    currentAgent: "Enrichment"
   };
 };
 

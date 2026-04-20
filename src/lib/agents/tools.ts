@@ -75,13 +75,29 @@ export const perplexity = {
  * Permet un basculement simple via variable d'environnement
  */
 export const searchEngine = {
-  invoke: async (query: string) => {
+  invoke: async (query: string, options: { depth?: "basic" | "advanced" } = {}) => {
     const provider = process.env.SEARCH_PROVIDER || "tavily";
-    console.log(`[SearchEngine] Utilisation du moteur: ${provider}`);
+    const depth = options.depth || "advanced";
+    
+    console.log(`[SearchEngine] Utilisation du moteur: ${provider} (Mode: ${depth})`);
+    
     if (provider === "perplexity") {
       return await perplexity.invoke(query);
     }
-    return await tavily.invoke(query);
+    
+    // Cas Tavily avec gestion de la profondeur
+    const response = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: process.env.TAVILY_API_KEY,
+        query,
+        search_depth: depth,
+        max_results: 15,
+      }),
+    });
+    const data = await response.json();
+    return JSON.stringify(data.results);
   }
 };
 
